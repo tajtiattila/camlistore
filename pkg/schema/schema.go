@@ -31,6 +31,7 @@ import (
 	"hash"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"reflect"
 	"regexp"
@@ -41,6 +42,7 @@ import (
 	"unicode/utf8"
 
 	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/schema/nodeattr"
 	"github.com/bradfitz/latlong"
 
 	"github.com/rwcarlsen/goexif/exif"
@@ -941,56 +943,88 @@ func findSize(v interface{}) (size int64, ok bool) {
 // It there was a valid EXIF but an error while trying to get a date from it,
 // it logs the error and tries the other methods.
 func FileTime(f io.ReaderAt) (time.Time, error) {
-	var ct time.Time
-	defaultTime := func() (time.Time, error) {
-		if osf, ok := f.(*os.File); ok {
-			fi, err := osf.Stat()
-			if err != nil {
-				return ct, fmt.Errorf("Failed to find a modtime: stat: %v", err)
-			}
-			return fi.ModTime(), nil
+	fm, err := FileContentMeta(f)
+	if err == nil {
+		if t, err := fm.Time(); err == nil {
+			return t, nil
 		}
-		return ct, errors.New("All methods failed to find a creation time or modtime.")
 	}
 
+	if osf, ok := f.(*os.File); ok {
+		fi, err := osf.Stat()
+		if err != nil {
+			return time.Time{}, fmt.Errorf("Failed to find a modtime: stat: %v", err)
+		}
+		return fi.ModTime(), nil
+	}
+	return time.Time{}, errors.New("All methods failed to find a creation time or modtime.")
+}
+
+// ContentMeta is metadata of file content.
+type ContentMeta struct {
+	// Attr describes other file metadata such as Exif/GPS location
+	Attr url.Values
+}
+
+// FileContentMeta returns the ContentMeta such as time created, and gps location
+// based on file content.
+func FileContentMeta(f io.ReaderAt) (*ContentMeta, error) {
 	size, ok := findSize(f)
 	if !ok {
 		size = 256 << 10 // enough to get the EXIF
 	}
 	r := io.NewSectionReader(f, 0, size)
-	var tiffErr error
-	ex, err := exif.Decode(r)
+	x, err := exif.Decode(r)
 	if err != nil {
-		tiffErr = err
 		if exif.IsShortReadTagValueError(err) {
-			return ct, io.ErrUnexpectedEOF
+			return nil, io.ErrUnexpectedEOF
 		}
 		if exif.IsCriticalError(err) || exif.IsExifError(err) {
-			return defaultTime()
+			return nil, err
 		}
 	}
-	ct, err = ex.DateTime()
-	if err != nil {
-		return defaultTime()
-	}
-	// If the EXIF file only had local timezone, but it did have
-	// GPS, then lookup the timezone and correct the time.
-	if ct.Location() == time.Local {
-		if exif.IsGPSError(tiffErr) {
-			log.Printf("Invalid EXIF GPS data: %v", tiffErr)
-			return ct, nil
+
+	m := new(ContentMeta)
+	set := func(k, v string) {
+		if m.Attr == nil {
+			m.Attr = make(url.Values)
 		}
-		if lat, long, err := ex.LatLong(); err == nil {
+		m.Attr.Set(k, v)
+	}
+
+	ct, timeErr := x.DateTime()
+	if timeErr != nil {
+		set(nodeattr.DateCreated, RFC3339FromTime(ct))
+	}
+
+	if lat, long, err := x.LatLong(); err == nil {
+		set(nodeattr.Latitude, fmt.Sprintf("%f", lat))
+		set(nodeattr.Longitude, fmt.Sprintf("%f", long))
+
+		// If the EXIF file only had local timezone, but it did have
+		// GPS, then lookup the timezone and correct the time.
+		if timeErr == nil && ct.Location() == time.Local {
 			if loc := lookupLocation(latlong.LookupZoneName(lat, long)); loc != nil {
-				if t, err := exifDateTimeInLocation(ex, loc); err == nil {
-					return t, nil
+				if t, err := exifDateTimeInLocation(x, loc); err == nil {
+					set(nodeattr.DateCreated, RFC3339FromTime(t))
 				}
 			}
-		} else if !exif.IsTagNotPresentError(err) {
-			log.Printf("Invalid EXIF GPS data: %v", err)
 		}
 	}
-	return ct, nil
+
+	if m.Attr == nil {
+		// no metadata found
+		return nil, timeErr
+	}
+
+	return m, nil
+}
+
+func (m *ContentMeta) Time() (time.Time, error) {
+	if v := m.Attr.Get(nodeattr.DateCreated); v != "" {
+		return time.Parse(v, time.RFC3339)
+	}
+	return time.Time{}, fmt.Errorf("%s is not present in ContentMeta", nodeattr.DateCreated)
 }
 
 // This is basically a copy of the exif.Exif.DateTime() method, except:

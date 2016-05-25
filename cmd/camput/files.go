@@ -27,6 +27,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,6 +54,7 @@ type fileCmd struct {
 	makePermanode     bool // make new, unique permanode of the root (dir or file)
 	filePermanodes    bool // make planned permanodes for each file (based on their digest)
 	vivify            bool
+	metadata          bool // store metadata (EXIF attrs) in file permanodes
 	exifTime          bool // use metadata (such as in EXIF) to find the creation time of the file
 	capCtime          bool // use mtime as creation time of the file, if it would be bigger than modification time
 	diskUsage         bool // show "du" disk usage only (dry run mode), don't actually upload
@@ -84,6 +86,7 @@ func init() {
 			"If true, ask the server to create and sign permanode(s) associated with each uploaded"+
 				" file. This permits the server to have your signing key. Used mostly with untrusted"+
 				" or at-risk clients, such as phones.")
+		flags.BoolVar(&cmd.metadata, "metadata", false, "Try to get metadata (such as EXIF) and store its values in the file permanode. Implies exiftime.")
 		flags.BoolVar(&cmd.exifTime, "exiftime", false, "Try to use metadata (such as EXIF) to get a stable creation time. If found, used as the replacement for the modtime. Mainly useful with vivify or filenodes.")
 		flags.StringVar(&cmd.title, "title", "", "Optional title attribute to set on permanode when using -permanode.")
 		flags.StringVar(&cmd.tag, "tag", "", "Optional tag(s) to set on permanode when using -permanode or -filenodes. Single value or comma separated.")
@@ -173,7 +176,8 @@ func (c *fileCmd) RunCommand(args []string) error {
 		permanode:    c.filePermanodes,
 		tag:          c.tag,
 		vivify:       c.vivify,
-		exifTime:     c.exifTime,
+		metadata:     c.metadata,
+		exifTime:     c.metadata || c.exifTime,
 		capCtime:     c.capCtime,
 		contentsOnly: c.contentsOnly,
 	}
@@ -566,17 +570,28 @@ func (up *Uploader) uploadNodeRegularFile(n *node) (*client.PutResult, error) {
 		return nil, err
 	}
 	defer file.Close()
+
+	var contentMetadata url.Values
 	if !up.fileOpts.contentsOnly {
-		if up.fileOpts.exifTime {
+		if up.fileOpts.metadata || up.fileOpts.exifTime {
 			ra, ok := file.(io.ReaderAt)
 			if !ok {
 				return nil, errors.New("Error asserting local file to io.ReaderAt")
 			}
-			modtime, err := schema.FileTime(ra)
+			fileMeta, err := schema.FileContentMeta(ra)
 			if err != nil {
 				log.Printf("warning: getting time from EXIF failed for %v: %v", n.fullPath, err)
 			} else {
-				filebb.SetModTime(modtime)
+				if up.fileOpts.metadata {
+					contentMetadata = fileMeta.Attr
+				}
+				if up.fileOpts.exifTime {
+					// NB: filebb.ModTime is already set to n.fi.ModTime
+					t, err := fileMeta.Time()
+					if err != nil {
+						filebb.SetModTime(t)
+					}
+				}
 			}
 		}
 		if up.fileOpts.wantCapCtime() {
@@ -668,7 +683,7 @@ func (up *Uploader) uploadNodeRegularFile(n *node) (*client.PutResult, error) {
 		if !ok {
 			return nil, fmt.Errorf("couldn't get modtime for file %v", n.fullPath)
 		}
-		err = up.uploadFilePermanode(sum, br, claimTime)
+		err = up.uploadFilePermanode(sum, br, claimTime, contentMetadata)
 		if err != nil {
 			return nil, fmt.Errorf("Error uploading permanode for node %v: %v", n, err)
 		}
@@ -687,7 +702,7 @@ func (up *Uploader) uploadNodeRegularFile(n *node) (*client.PutResult, error) {
 // uploadFilePermanode creates and uploads the planned permanode (with sum as a
 // fixed key) associated with the file blobref fileRef.
 // It also sets the optional tags for this permanode.
-func (up *Uploader) uploadFilePermanode(sum string, fileRef blob.Ref, claimTime time.Time) error {
+func (up *Uploader) uploadFilePermanode(sum string, fileRef blob.Ref, claimTime time.Time, fileMeta url.Values) error {
 	// Use a fixed time value for signing; not using modtime
 	// so two identical files don't have different modtimes?
 	// TODO(bradfitz): consider this more?
@@ -715,27 +730,39 @@ func (up *Uploader) uploadFilePermanode(sum string, fileRef blob.Ref, claimTime 
 
 	handleResult("node-permanode-contentattr", put, nil)
 	if tags := up.fileOpts.tags(); len(tags) > 0 {
+		if fileMeta == nil {
+			fileMeta = make(url.Values)
+		}
+		fileMeta["tag"] = append(fileMeta["tag"], tags...)
+	}
+
+	if len(fileMeta) != 0 {
+		n := 0
 		errch := make(chan error)
-		for _, tag := range tags {
-			go func(tag string) {
-				m := schema.NewAddAttributeClaim(permaNode.BlobRef, "tag", tag)
-				m.SetClaimDate(claimTime)
-				signed, err := m.SignAt(signer, claimTime)
-				if err != nil {
-					errch <- fmt.Errorf("Failed to sign tag claim: %v", err)
-					return
-				}
-				put, err := up.uploadString(signed)
-				if err != nil {
-					errch <- fmt.Errorf("Error uploading permanode's tag attribute %v: %v", tag, err)
-					return
-				}
-				handleResult("node-permanode-tag", put, nil)
-				errch <- nil
-			}(tag)
+		for k, vs := range fileMeta {
+			for _, v := range vs {
+				go func(k, v string) {
+					m := schema.NewAddAttributeClaim(permaNode.BlobRef, k, v)
+					m.SetClaimDate(claimTime)
+					signed, err := m.SignAt(signer, claimTime)
+					if err != nil {
+						errch <- fmt.Errorf("Failed to sign %s claim: %v", k, err)
+						return
+					}
+					put, err := up.uploadString(signed)
+					if err != nil {
+						errch <- fmt.Errorf("Error uploading permanode's %v attribute %v: %v", k, v, err)
+						return
+					}
+					handleResult("node-permanode-"+k, put, nil)
+					errch <- nil
+				}(k, v)
+
+				n++
+			}
 		}
 
-		for range tags {
+		for i := 0; i < n; i++ {
 			if e := <-errch; e != nil && err == nil {
 				err = e
 			}
@@ -744,6 +771,7 @@ func (up *Uploader) uploadFilePermanode(sum string, fileRef blob.Ref, claimTime 
 			return err
 		}
 	}
+
 	return nil
 }
 

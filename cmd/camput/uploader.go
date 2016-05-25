@@ -58,6 +58,7 @@ type fileOptions struct {
 	tag string
 	// perform for the client the actions needing gpg signing when uploading a file.
 	vivify       bool
+	metadata     bool // store the metadata in file permanodes if possible.
 	exifTime     bool // use the time in exif metadata as the modtime if possible.
 	capCtime     bool // use mtime as ctime if ctime > mtime
 	contentsOnly bool // do not store any of the file's attributes, only its contents.
