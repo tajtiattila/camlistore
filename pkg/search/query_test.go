@@ -533,6 +533,31 @@ func TestQueryPermanodeValueMatchesFloat(t *testing.T) {
 	})
 }
 
+func TestQueryPermanodeLocation(t *testing.T) {
+	testQuery(t, func(qt *queryTest) {
+		id := qt.id
+
+		p1 := id.NewPlannedPermanode("1")
+		p2 := id.NewPlannedPermanode("2")
+		p3 := id.NewPlannedPermanode("3")
+		id.SetAttribute(p1, "latitude", "51.5")
+		id.SetAttribute(p1, "longitude", "0")
+		id.SetAttribute(p2, "latitude", "51.5")
+		id.SetAttribute(p3, "longitude", "0")
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Permanode: &PermanodeConstraint{
+					Location: &LocationConstraint{
+						Any: true,
+					},
+				},
+			},
+		}
+		qt.wantRes(sq, p1)
+	})
+}
+
 // find permanodes matching a certain file query
 func TestQueryFileConstraint(t *testing.T) {
 	testQuery(t, func(qt *queryTest) {

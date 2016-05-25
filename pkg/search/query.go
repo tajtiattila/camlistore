@@ -1369,10 +1369,13 @@ func (c *PermanodeConstraint) blobMatches(ctx context.Context, s *search, br blo
 	}
 
 	if c.Location != nil {
-		if corpus == nil {
-			return false, nil
+		var lat, long float64
+		var ok bool
+		if corpus != nil {
+			lat, long, ok = corpus.PermanodeLatLong(br, c.At)
+		} else {
+			lat, long, ok = dp.attrLatLong()
 		}
-		lat, long, ok := corpus.PermanodeLatLong(br, c.At)
 		if !ok || !c.Location.matchesLatLong(lat, long) {
 			return false, nil
 		}

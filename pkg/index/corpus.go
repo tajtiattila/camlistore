@@ -1166,6 +1166,10 @@ func (c *Corpus) FileLatLong(fileRef blob.Ref) (lat, long float64, ok bool) {
 
 // zero value of at means current
 func (c *Corpus) PermanodeLatLong(pn blob.Ref, at time.Time) (lat, long float64, ok bool) {
+	lat, long, ok = c.permanodeAttrLatLong(pn, at)
+	if ok {
+		return lat, long, ok
+	}
 	nodeType := c.PermanodeAttrValue(pn, "camliNodeType", at, blob.Ref{})
 	if nodeType == "" {
 		return
@@ -1179,19 +1183,22 @@ func (c *Corpus) PermanodeLatLong(pn blob.Ref, at time.Time) (lat, long float64,
 		}
 		return c.PermanodeLatLong(venuePn, at)
 	}
-	if nodeType == "foursquare.com:venue" || nodeType == "twitter.com:tweet" {
-		var err error
-		lat, err = strconv.ParseFloat(c.PermanodeAttrValue(pn, "latitude", at, blob.Ref{}), 64)
-		if err != nil {
-			return
-		}
-		long, err = strconv.ParseFloat(c.PermanodeAttrValue(pn, "longitude", at, blob.Ref{}), 64)
-		if err != nil {
-			return
-		}
-		return lat, long, true
-	}
 	return
+}
+
+// permanodeAttrLatLong returns lat and long from permanode attributes,
+// if the permanode has both of them set.
+func (c *Corpus) permanodeAttrLatLong(pn blob.Ref, at time.Time) (lat, long float64, ok bool) {
+	var err error
+	lat, err = strconv.ParseFloat(c.PermanodeAttrValue(pn, nodeattr.Latitude, at, blob.Ref{}), 64)
+	if err != nil {
+		return
+	}
+	long, err = strconv.ParseFloat(c.PermanodeAttrValue(pn, nodeattr.Longitude, at, blob.Ref{}), 64)
+	if err != nil {
+		return
+	}
+	return lat, long, true
 }
 
 // ForeachClaim calls fn for each claim of permaNode.

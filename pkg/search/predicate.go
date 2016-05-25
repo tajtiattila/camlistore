@@ -585,10 +585,21 @@ func (l location) Predicate(ctx context.Context, args []string) (*Constraint, er
 			North: rect.NorthEast.Lat,
 			South: rect.SouthWest.Lat,
 		}
-		fileLoc := permOfFile(&FileConstraint{
-			IsImage:  true,
-			Location: loc,
-		})
+		fileLoc := andConst(
+			// Disregard location of the file if the location
+			// is set explicitly on the permanode itself.
+			notConst(&Constraint{
+				Permanode: &PermanodeConstraint{
+					Location: &LocationConstraint{
+						Any: true,
+					},
+				},
+			}),
+			permOfFile(&FileConstraint{
+				IsImage:  true,
+				Location: loc,
+			}),
+		)
 		permLoc := &Constraint{
 			Permanode: &PermanodeConstraint{
 				Location: loc,

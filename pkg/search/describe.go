@@ -25,12 +25,14 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/httputil"
+	"camlistore.org/pkg/schema/nodeattr"
 	"camlistore.org/pkg/types/camtypes"
 	"go4.org/syncutil"
 	"go4.org/types"
@@ -482,6 +484,18 @@ func (dp *DescribedPermanode) IsContainer() bool {
 		}
 	}
 	return false
+}
+
+func (dp *DescribedPermanode) attrLatLong() (lat, long float64, ok bool) {
+	lat, err := strconv.ParseFloat(dp.Attr.Get(nodeattr.Latitude), 64)
+	if err != nil {
+		return
+	}
+	long, err = strconv.ParseFloat(dp.Attr.Get(nodeattr.Longitude), 64)
+	if err != nil {
+		return
+	}
+	return lat, long, true
 }
 
 // NewDescribeRequest returns a new DescribeRequest holding the state
