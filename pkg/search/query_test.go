@@ -1579,3 +1579,84 @@ func BenchmarkQueryPermanodeLocation(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkQueryPermanodeLatLong aims at measuring the impact of
+// https://camlistore-review.googlesource.com/8049
+// ( + https://camlistore-review.googlesource.com/8649)
+// on location queries.
+// It populates the corpus with enough fake foursquare checkins and twitter
+// locations to look realistic.
+// The CLs mentioned above introduce the ability to find locations in any kind
+// of permanode, as well as in the content of permanodes. In other words, location
+// queries at rev 6c1ae1d865504c3af0f9cc6072263a4dd2e85df2, which use
+// PermanodeLatLong, only take into account foursquare venues and twitter
+// permanodes. Therefore, for the comparison to be fair, this benchmark only
+// populates with locations that would be found at rev
+// 6c1ae1d865504c3af0f9cc6072263a4dd2e85df2, so that no unfair extra work is
+// performed when testing with CL8049.
+func BenchmarkQueryPermanodeLatLong(b *testing.B) {
+	b.ReportAllocs()
+	testQueryTypes(b, corpusTypeOnly, func(qt *queryTest) {
+		id := qt.id
+
+		var n int
+		newPn := func() blob.Ref {
+			n++
+			return id.NewPlannedPermanode(fmt.Sprint(n))
+		}
+
+		// create (~700) venues all over the world, and mark 25% of them as places we've been to
+		checkinIdx := 0
+		for long := -180; long < 180; long += 10 {
+			for lat := -90; lat < 90; lat += 10 {
+				pn := newPn()
+				id.SetAttribute(pn, "camliNodeType", "foursquare.com:venue")
+				id.SetAttribute(pn, "latitude", fmt.Sprintf("%f", lat))
+				id.SetAttribute(pn, "longitude", fmt.Sprintf("%f", long))
+				if checkinIdx%4 == 0 {
+					qn := newPn()
+					id.SetAttribute(qn, "camliNodeType", "foursquare.com:checkin")
+					id.SetAttribute(qn, "foursquareVenuePermanode", pn.String())
+				}
+				checkinIdx++
+			}
+		}
+
+		// create 3K tweets, all with locations
+		lat := 45.18
+		long := 5.72
+		for i := 0; i < 3000; i++ {
+			pn := newPn()
+			id.SetAttribute(pn, "camliNodeType", "twitter.com:tweet")
+			id.SetAttribute(pn, "latitude", fmt.Sprintf("%f", lat))
+			id.SetAttribute(pn, "longitude", fmt.Sprintf("%f", long))
+			lat += 0.01
+			long += 0.01
+		}
+
+		// create 5K additional permanodes, but no location.
+		for i := 0; i < 5000; i++ {
+			newPn()
+		}
+
+		h := qt.Handler()
+		b.ResetTimer()
+
+		locations := []string{
+			"canada", "scotland", "france", "sweden", "germany", "poland", "russia", "algeria", "congo", "china", "india", "australia", "mexico", "brazil", "argentina",
+		}
+		for i := 0; i < b.N; i++ {
+			for _, loc := range locations {
+				req := &SearchQuery{
+					Expression: "loc:" + loc,
+				}
+				resp, err := h.Query(req)
+				if err != nil {
+					qt.t.Fatal(err)
+				}
+				b.Logf("found %d permanodes in %v", len(resp.Blobs), loc)
+			}
+		}
+
+	})
+}
