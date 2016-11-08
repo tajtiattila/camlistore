@@ -80,6 +80,13 @@ func Lookup(ctx context.Context, address string) ([]Rect, error) {
 	return rectsi.([]Rect), nil
 }
 
+// Cache caches the geocode address, useful for testing.
+func Cache(address string, r ...Rect) {
+	mu.Lock()
+	cache[address] = r
+	mu.Unlock()
+}
+
 type googleResTop struct {
 	Results []*googleResult `json:"results"`
 }

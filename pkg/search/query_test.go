@@ -1,11 +1,15 @@
 package search_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
-	"path/filepath"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"math"
+	"math/rand"
 	"reflect"
 	"sort"
 	"strings"
@@ -14,11 +18,12 @@ import (
 	"time"
 
 	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/geocode"
 	"camlistore.org/pkg/index"
 	"camlistore.org/pkg/index/indextest"
-	"camlistore.org/pkg/osutil"
 	. "camlistore.org/pkg/search"
 	"camlistore.org/pkg/test"
+	"github.com/tajtiattila/metadata/exif"
 	"go4.org/types"
 	"golang.org/x/net/context"
 )
@@ -1515,69 +1520,7 @@ func benchmarkQueryPermanodes(b *testing.B, describe bool) {
 }
 
 func BenchmarkQueryPermanodeLocation(b *testing.B) {
-	b.ReportAllocs()
-	testQueryTypes(b, corpusTypeOnly, func(qt *queryTest) {
-		id := qt.id
-
-		// Upload a basic image
-		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
-		if err != nil {
-			panic("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
-		}
-		uploadFile := func(file string, modTime time.Time) blob.Ref {
-			fileName := filepath.Join(camliRootPath, "pkg", "search", "testdata", file)
-			contents, err := ioutil.ReadFile(fileName)
-			if err != nil {
-				panic(err)
-			}
-			br, _ := id.UploadFile(file, string(contents), modTime)
-			return br
-		}
-		fileRef := uploadFile("dude-gps.jpg", time.Time{})
-
-		var n int
-		newPn := func() blob.Ref {
-			n++
-			return id.NewPlannedPermanode(fmt.Sprint(n))
-		}
-
-		pn := id.NewPlannedPermanode("photo")
-		id.SetAttribute(pn, "camliContent", fileRef.String())
-
-		for i := 0; i < 5; i++ {
-			pn := newPn()
-			id.SetAttribute(pn, "camliNodeType", "foursquare.com:venue")
-			id.SetAttribute(pn, "latitude", fmt.Sprint(50-i))
-			id.SetAttribute(pn, "longitude", fmt.Sprint(i))
-			for j := 0; j < 5; j++ {
-				qn := newPn()
-				id.SetAttribute(qn, "camliNodeType", "foursquare.com:checkin")
-				id.SetAttribute(qn, "foursquareVenuePermanode", pn.String())
-			}
-		}
-		for i := 0; i < 10; i++ {
-			pn := newPn()
-			id.SetAttribute(pn, "foo", fmt.Sprint(i))
-		}
-
-		req := &SearchQuery{
-			Constraint: &Constraint{
-				Permanode: &PermanodeConstraint{
-					Location: &LocationConstraint{Any: true},
-				},
-			},
-		}
-
-		h := qt.Handler()
-		b.ResetTimer()
-
-		for i := 0; i < b.N; i++ {
-			_, err := h.Query(req)
-			if err != nil {
-				qt.t.Fatal(err)
-			}
-		}
-	})
+	benchmarkQueryPermanodeLatLong(b, true)
 }
 
 // BenchmarkQueryPermanodeLatLong aims at measuring the impact of
@@ -1595,6 +1538,10 @@ func BenchmarkQueryPermanodeLocation(b *testing.B) {
 // 6c1ae1d865504c3af0f9cc6072263a4dd2e85df2, so that no unfair extra work is
 // performed when testing with CL8049.
 func BenchmarkQueryPermanodeLatLong(b *testing.B) {
+	benchmarkQueryPermanodeLatLong(b, false)
+}
+
+func benchmarkQueryPermanodeLatLong(b *testing.B, wantFiles bool) {
 	b.ReportAllocs()
 	testQueryTypes(b, corpusTypeOnly, func(qt *queryTest) {
 		id := qt.id
@@ -1603,6 +1550,16 @@ func BenchmarkQueryPermanodeLatLong(b *testing.B) {
 		newPn := func() blob.Ref {
 			n++
 			return id.NewPlannedPermanode(fmt.Sprint(n))
+		}
+
+		if wantFiles {
+			// create 2000 photos scattered uniformly all over the world
+			r := rand.New(rand.NewSource(1))
+			for i := 0; i < 2000; i++ {
+				br, _ := id.UploadFile("photo.jpg", genimg.at(rndLatLong(r)), time.Time{})
+				pn := newPn()
+				id.SetAttribute(pn, "camliContent", br.String())
+			}
 		}
 
 		// create (~700) venues all over the world, and mark 25% of them as places we've been to
@@ -1649,6 +1606,7 @@ func BenchmarkQueryPermanodeLatLong(b *testing.B) {
 			for _, loc := range locations {
 				req := &SearchQuery{
 					Expression: "loc:" + loc,
+					Limit:      1e9,
 				}
 				resp, err := h.Query(req)
 				if err != nil {
@@ -1659,4 +1617,88 @@ func BenchmarkQueryPermanodeLatLong(b *testing.B) {
 		}
 
 	})
+}
+
+var genimg = newGenImg(128, 128)
+
+type genImg struct {
+	dx, dy int
+	jpg    []byte
+
+	mtx    sync.Mutex
+	images map[geocode.LatLong]string
+}
+
+func newGenImg(dx, dy int) *genImg {
+	im := image.NewRGBA(image.Rect(0, 0, dx, dy))
+	for x := 0; x < dx; x++ {
+		for y := 0; y < dy; y++ {
+			im.Set(x, y, color.RGBA{255, 255, 0, 255})
+		}
+	}
+
+	jpg := new(bytes.Buffer)
+	err := jpeg.Encode(jpg, im, nil)
+	if err != nil {
+		panic("jpeg.Encode failed")
+	}
+	return &genImg{
+		dx:     dx,
+		dy:     dy,
+		jpg:    jpg.Bytes(),
+		images: make(map[geocode.LatLong]string),
+	}
+}
+
+func (g *genImg) at(lat, long float64) string {
+	g.mtx.Lock()
+	defer g.mtx.Unlock()
+
+	m, ok := g.images[geocode.LatLong{lat, long}]
+	if !ok {
+		x := exif.New(g.dx, g.dy)
+		x.SetLatLong(lat, long)
+		buf := new(bytes.Buffer)
+		err := exif.Copy(buf, bytes.NewReader(g.jpg), x)
+		if err != nil {
+			panic("exif.Copy failed")
+		}
+		m = buf.String()
+		g.images[geocode.LatLong{lat, long}] = m
+	}
+	return m
+}
+
+func rndLatLong(r *rand.Rand) (lat, long float64) {
+	u, v := r.Float64(), r.Float64()
+
+	long = u*360 - 180
+	lat = math.Acos(2*v-1)*180/math.Pi - 90
+
+	return lat, long
+}
+
+func cacheGeo(address string, n, e, s, w float64) {
+	geocode.Cache(address, geocode.Rect{
+		NorthEast: geocode.LatLong{Lat: n, Long: e},
+		SouthWest: geocode.LatLong{Lat: s, Long: w},
+	})
+}
+
+func init() {
+	cacheGeo("canada", 83.0956562, -52.6206965, 41.6765559, -141.00187)
+	cacheGeo("scotland", 60.8607515, -0.7246751, 54.6332381, -8.6498706)
+	cacheGeo("france", 51.0891285, 9.560067700000001, 41.3423275, -5.142307499999999)
+	cacheGeo("sweden", 69.0599709, 24.1665922, 55.3367024, 10.9631865)
+	cacheGeo("germany", 55.0581235, 15.0418962, 47.2701114, 5.8663425)
+	cacheGeo("poland", 54.835784, 24.1458933, 49.0020251, 14.1228641)
+	cacheGeo("russia", 81.858122, -169.0456324, 41.1853529, 19.6404268)
+	cacheGeo("algeria", 37.0898204, 11.999999, 18.968147, -8.667611299999999)
+	cacheGeo("congo", 3.707791, 18.6436109, -5.0289719, 11.1530037)
+	cacheGeo("china", 53.5587015, 134.7728098, 18.1576156, 73.4994136)
+	cacheGeo("india", 35.5087008, 97.395561, 6.7535159, 68.1623859)
+	cacheGeo("australia", -9.2198214, 159.2557541, -54.7772185, 112.9215625)
+	cacheGeo("mexico", 32.7187629, -86.7105711, 14.5345486, -118.3649292)
+	cacheGeo("brazil", 5.2717863, -29.3448224, -33.7506241, -73.98281709999999)
+	cacheGeo("argentina", -21.7810459, -53.6374811, -55.05727899999999, -73.56036019999999)
 }
