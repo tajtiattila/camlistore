@@ -24,8 +24,10 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -38,34 +40,107 @@ import (
 	"camlistore.org/pkg/osutil"
 	. "camlistore.org/pkg/search"
 	"camlistore.org/pkg/test"
+	"camlistore.org/pkg/types/camtypes"
 )
 
-// An indexOwnerer is something that knows who owns the index.
-// It is implemented by indexAndOwner for use by TestHandler.
-type indexOwnerer interface {
-	IndexOwner() blob.Ref
+type indexMapper struct {
+	*indextest.IndexDeps
+
+	Refs map[string]blob.Ref
 }
 
-type indexAndOwner struct {
-	index.Interface
-	owner blob.Ref
+func (m *indexMapper) AddPermanode(key string, attrs ...string) blob.Ref {
+	pn := m.NewPlannedPermanode(key)
+	m.Refs[key] = pn
+	for len(attrs) > 0 {
+		k, v := attrs[0], attrs[1]
+		attrs = attrs[2:]
+		m.AddAttribute(pn, k, v)
+	}
+	return pn
 }
 
-func (io indexAndOwner) IndexOwner() blob.Ref {
-	return io.owner
+func (m *indexMapper) AddFile(key string, nbytes int) blob.Ref {
+	contents := strings.Repeat(key, nbytes/len(key)+1)[:nbytes]
+	// use a file name that is not a blobRef to avoid remapping
+	fileRef, wholeRef := m.UploadFile(strings.Replace(key, "-", "", 1), contents, time.Time{})
+	m.Refs[key] = fileRef
+	m.Refs["whole"+key] = wholeRef
+	return fileRef
+}
+
+func (m *indexMapper) Ref(key string) blob.Ref {
+	r, ok := m.Refs[key]
+	if !ok {
+		panic("key missing from indexMapper")
+	}
+	return r
+}
+
+var blobRefPattern = regexp.MustCompile(blob.Pattern)
+
+func (m *indexMapper) Map(key string) string {
+	return blobRefPattern.ReplaceAllStringFunc(key, func(s string) string {
+		r, ok := m.Refs[s]
+		if ok {
+			return r.String()
+		}
+		return s
+	})
+}
+
+func (m *indexMapper) MapUrl(urlStr string) string {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		panic(err)
+	}
+	q := u.Query()
+	for _, vv := range q {
+		for i, v := range vv {
+			vv[i] = m.Map(v)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func (m *indexMapper) MapMap(src map[string]interface{}) map[string]interface{} {
+	dst := make(map[string]interface{})
+	for k, v := range src {
+		dst[m.Map(k)] = m.mapIntf(v)
+	}
+	return dst
+}
+
+func (m *indexMapper) mapIntf(src interface{}) interface{} {
+	switch x := src.(type) {
+	case map[string]interface{}:
+		return m.MapMap(x)
+	case []interface{}:
+		res := make([]interface{}, len(x))
+		for i, v := range x {
+			res[i] = m.mapIntf(v)
+		}
+		return res
+	case string:
+		return m.Map(x)
+	default:
+		return src
+	}
 }
 
 type handlerTest struct {
 	// setup is responsible for populating the index before the
 	// handler is invoked.
 	//
-	// A FakeIndex is constructed and provided to setup and is
-	// generally then returned as the Index to use, but an
-	// alternate Index may be returned instead, in which case the
-	// FakeIndex is not used.
-	setup func(fi *test.FakeIndex) index.Interface
+	// An indexMapper is constructed and provided to setup.
+	setup func(im *indexMapper) index.Interface
 
-	name     string // test name
+	name string // test name
+
+	// References in query, postBody, want and wantDescribed
+	// are replaced with references in the indexMapper.
+
 	query    string // the HTTP path + optional query suffix after "camli/search/"
 	postBody string // if non-nil, a POST request
 
@@ -75,8 +150,6 @@ type handlerTest struct {
 	// want is ignored.
 	wantDescribed []string
 }
-
-var owner = blob.MustParse("abcown-123")
 
 func parseJSON(s string) map[string]interface{} {
 	m := make(map[string]interface{})
@@ -93,64 +166,57 @@ func addToClockOrigin(d time.Duration) string {
 	return test.ClockOrigin.Add(d).UTC().Format(time.RFC3339Nano)
 }
 
-func handlerDescribeTestSetup(fi *test.FakeIndex) index.Interface {
-	pn := blob.MustParse("perma-123")
-	fi.AddMeta(pn, "permanode", 123)
-	fi.AddClaim(owner, pn, "set-attribute", "camliContent", "fakeref-232")
-	fi.AddMeta(blob.MustParse("fakeref-232"), "", 878)
+func handlerDescribeTestSetup(im *indexMapper) index.Interface {
+	pn := im.AddPermanode("perma-123")
+	f := im.AddFile("fakeref-232", 878)
+	im.SetAttribute(pn, "camliContent", f.String())
 
 	// Test deleting all attributes
-	fi.AddClaim(owner, pn, "add-attribute", "wont-be-present", "x")
-	fi.AddClaim(owner, pn, "add-attribute", "wont-be-present", "y")
-	fi.AddClaim(owner, pn, "del-attribute", "wont-be-present", "")
+	im.AddAttribute(pn, "wont-be-present", "x")
+	im.AddAttribute(pn, "wont-be-present", "y")
+	im.DelAttribute(pn, "wont-be-present", "")
 
 	// Test deleting a specific attribute.
-	fi.AddClaim(owner, pn, "add-attribute", "only-delete-b", "a")
-	fi.AddClaim(owner, pn, "add-attribute", "only-delete-b", "b")
-	fi.AddClaim(owner, pn, "add-attribute", "only-delete-b", "c")
-	fi.AddClaim(owner, pn, "del-attribute", "only-delete-b", "b")
-	return fi
+	im.AddAttribute(pn, "only-delete-b", "a")
+	im.AddAttribute(pn, "only-delete-b", "b")
+	im.AddAttribute(pn, "only-delete-b", "c")
+	im.DelAttribute(pn, "only-delete-b", "b")
+
+	return im.Index
 }
 
 // extends handlerDescribeTestSetup but adds a camliContentImage to pn.
-func handlerDescribeTestSetupWithImage(fi *test.FakeIndex) index.Interface {
-	handlerDescribeTestSetup(fi)
-	pn := blob.MustParse("perma-123")
-	imageRef := blob.MustParse("fakeref-789")
-	fi.AddMeta(imageRef, "", 789)
-	fi.AddClaim(owner, pn, "set-attribute", "camliContentImage", imageRef.String())
-	return fi
+func handlerDescribeTestSetupWithImage(im *indexMapper) index.Interface {
+	handlerDescribeTestSetup(im)
+	pn := im.Ref("perma-123")
+	imageRef := im.AddFile("fakeref-789", 789)
+	im.SetAttribute(pn, "camliContentImage", imageRef.String())
+	return im.Index
 }
 
 // extends handlerDescribeTestSetup but adds various embedded references to other nodes.
-func handlerDescribeTestSetupWithEmbeddedRefs(fi *test.FakeIndex) index.Interface {
-	handlerDescribeTestSetup(fi)
-	pn := blob.MustParse("perma-123")
-	c1 := blob.MustParse("fakeref-01")
-	c2 := blob.MustParse("fakeref-02")
-	c3 := blob.MustParse("fakeref-03")
-	c4 := blob.MustParse("fakeref-04")
-	c5 := blob.MustParse("fakeref-05")
-	c6 := blob.MustParse("fakeref-06")
-	fi.AddMeta(c1, "", 1)
-	fi.AddMeta(c2, "", 2)
-	fi.AddMeta(c3, "", 3)
-	fi.AddMeta(c4, "", 4)
-	fi.AddMeta(c5, "", 5)
-	fi.AddMeta(c6, "", 6)
-	fi.AddClaim(owner, pn, "set-attribute", c1.String(), "foo")
-	fi.AddClaim(owner, pn, "set-attribute", "foo,"+c2.String()+"=bar", "foo")
-	fi.AddClaim(owner, pn, "set-attribute", "foo:"+c3.String()+"?bar,"+c4.String(), "foo")
-	fi.AddClaim(owner, pn, "set-attribute", "foo", c5.String())
-	fi.AddClaim(owner, pn, "add-attribute", "bar", "baz")
-	fi.AddClaim(owner, pn, "add-attribute", "bar", "monkey\n"+c6.String())
-	return fi
+func handlerDescribeTestSetupWithEmbeddedRefs(im *indexMapper) index.Interface {
+	handlerDescribeTestSetup(im)
+	pn := im.Ref("perma-123")
+	c1 := im.AddPermanode("fakeref-01", "title", "fake01")
+	c2 := im.AddPermanode("fakeref-02", "title", "fake02")
+	c3 := im.AddPermanode("fakeref-03", "title", "fake03")
+	c4 := im.AddPermanode("fakeref-04", "title", "fake04")
+	c5 := im.AddPermanode("fakeref-05", "title", "fake05")
+	c6 := im.AddPermanode("fakeref-06", "title", "fake06")
+	im.SetAttribute(pn, c1.String(), "foo")
+	im.SetAttribute(pn, "foo,"+c2.String()+"=bar", "foo")
+	im.SetAttribute(pn, "foo:"+c3.String()+"?bar,"+c4.String(), "foo")
+	im.SetAttribute(pn, "foo", c5.String())
+	im.AddAttribute(pn, "bar", "baz")
+	im.AddAttribute(pn, "bar", "monkey\n"+c6.String())
+	return im.Index
 }
 
 var handlerTests = []handlerTest{
 	{
 		name:  "describe-missing",
-		setup: func(fi *test.FakeIndex) index.Interface { return fi },
+		setup: func(im *indexMapper) index.Interface { return im.Index },
 		query: "describe?blobref=eabfakeref-0555",
 		want: parseJSON(`{
 			"meta": {
@@ -160,17 +226,14 @@ var handlerTests = []handlerTest{
 
 	{
 		name: "describe-jpeg-blob",
-		setup: func(fi *test.FakeIndex) index.Interface {
-			fi.AddMeta(blob.MustParse("abfakeref-0555"), "", 999)
-			return fi
+		setup: func(im *indexMapper) index.Interface {
+			im.AddFile("abfakeref-0555", 999)
+			return im.Index
 		},
 		query: "describe?blobref=abfakeref-0555",
 		want: parseJSON(`{
 			"meta": {
-				"abfakeref-0555": {
-					"blobRef":  "abfakeref-0555",
-					"size":     999
-				}
+				` + fileResult("abfakeref-0555", 999) + `
 			}
 		}`),
 	},
@@ -187,14 +250,10 @@ var handlerTests = []handlerTest{
 }`,
 		want: parseJSON(`{
 			"meta": {
-				"fakeref-232": {
-					"blobRef":  "fakeref-232",
-					"size":     878
-				},
+				` + fileResult("fakeref-232", 878) + `,
 				"perma-123": {
 					"blobRef":   "perma-123",
 					"camliType": "permanode",
-					"size":      123,
 					"permanode": {
 						"attr": {
 							"camliContent": [ "fakeref-232" ],
@@ -219,18 +278,11 @@ var handlerTests = []handlerTest{
 }`,
 		want: parseJSON(`{
 			"meta": {
-				"fakeref-232": {
-					"blobRef":  "fakeref-232",
-					"size":     878
-				},
-				"fakeref-789": {
-					"blobRef":  "fakeref-789",
-					"size":     789
-				},
+				` + fileResult("fakeref-232", 878) + `,
+				` + fileResult("fakeref-789", 789) + `,
 				"perma-123": {
 					"blobRef":   "perma-123",
 					"camliType": "permanode",
-					"size":      123,
 					"permanode": {
 						"attr": {
 							"camliContent": [ "fakeref-232" ],
@@ -252,38 +304,16 @@ var handlerTests = []handlerTest{
 		query: "describe?blobref=perma-123&depth=2",
 		want: parseJSON(`{
 			"meta": {
-				"fakeref-01": {
-				  "blobRef": "fakeref-01",
-				  "size": 1
-				},
-				"fakeref-02": {
-				  "blobRef": "fakeref-02",
-				  "size": 2
-				},
-				"fakeref-03": {
-				  "blobRef": "fakeref-03",
-				  "size": 3
-				},
-				"fakeref-04": {
-				  "blobRef": "fakeref-04",
-				  "size": 4
-				},
-				"fakeref-05": {
-				  "blobRef": "fakeref-05",
-				  "size": 5
-				},
-				"fakeref-06": {
-				  "blobRef": "fakeref-06",
-				  "size": 6
-				},
-				"fakeref-232": {
-					"blobRef":  "fakeref-232",
-					"size":     878
-				},
+				` + permResult("fakeref-01", "fake01", 9*time.Second) + `,
+				` + permResult("fakeref-02", "fake02", 10*time.Second) + `,
+				` + permResult("fakeref-03", "fake03", 11*time.Second) + `,
+				` + permResult("fakeref-04", "fake04", 12*time.Second) + `,
+				` + permResult("fakeref-05", "fake05", 13*time.Second) + `,
+				` + permResult("fakeref-06", "fake06", 14*time.Second) + `,
+				` + fileResult("fakeref-232", 878) + `,
 				"perma-123": {
 					"blobRef":   "perma-123",
 					"camliType": "permanode",
-					"size":      123,
 					"permanode": {
 						"attr": {
 							"bar": [
@@ -308,7 +338,7 @@ var handlerTests = []handlerTest{
 							"camliContent": [ "fakeref-232" ],
 							"only-delete-b": [ "a", "c" ]
 						},
-						"modtime": "` + addToClockOrigin(14*time.Second) + `"
+						"modtime": "` + addToClockOrigin(20*time.Second) + `"
 					}
 				}
 			}
@@ -328,14 +358,10 @@ var handlerTests = []handlerTest{
 }`,
 		want: parseJSON(`{
 			"meta": {
-				"fakeref-232": {
-					"blobRef":  "fakeref-232",
-					"size":     878
-				},
+				` + fileResult("fakeref-232", 878) + `,
 				"perma-123": {
 					"blobRef":   "perma-123",
 					"camliType": "permanode",
-					"size":      123,
 					"permanode": {
 						"attr": {
 							"camliContent": [ "fakeref-232" ],
@@ -351,13 +377,11 @@ var handlerTests = []handlerTest{
 	// test that describe follows camliPath:foo attributes
 	{
 		name: "describe-permanode-follows-camliPath",
-		setup: func(fi *test.FakeIndex) index.Interface {
-			pn := blob.MustParse("perma-123")
-			fi.AddMeta(pn, "permanode", 123)
-			fi.AddClaim(owner, pn, "set-attribute", "camliPath:foo", "fakeref-123")
-
-			fi.AddMeta(blob.MustParse("fakeref-123"), "", 123)
-			return fi
+		setup: func(im *indexMapper) index.Interface {
+			pn := im.AddPermanode("perma-123")
+			fakeref123 := im.AddFile("fakeref-123", 123)
+			im.SetAttribute(pn, "camliPath:foo", fakeref123.String())
+			return im.Index
 		},
 		query: "describe",
 		postBody: `{
@@ -368,14 +392,10 @@ var handlerTests = []handlerTest{
 }`,
 		want: parseJSON(`{
   "meta": {
-	"fakeref-123": {
-	  "blobRef": "fakeref-123",
-	  "size": 123
-	},
+	` + fileResult("fakeref-123", 123) + `,
 	"perma-123": {
 	  "blobRef": "perma-123",
 	  "camliType": "permanode",
-	  "size": 123,
 	  "permanode": {
 		"attr": {
 		  "camliPath:foo": [
@@ -392,15 +412,10 @@ var handlerTests = []handlerTest{
 	// Test recent permanodes
 	{
 		name: "recent-1",
-		setup: func(*test.FakeIndex) index.Interface {
-			// Ignore the fakeindex and use the real (but in-memory) implementation,
-			// using IndexDeps to populate it.
-			idx := index.NewMemoryIndex()
-			id := indextest.NewIndexDeps(idx)
-
-			pn := id.NewPlannedPermanode("pn1")
-			id.SetAttribute(pn, "title", "Some title")
-			return indexAndOwner{idx, id.SignerBlobRef}
+		setup: func(im *indexMapper) index.Interface {
+			pn := im.NewPlannedPermanode("pn1")
+			im.SetAttribute(pn, "title", "Some title")
+			return im.Index
 		},
 		query: "recent",
 		want: parseJSON(`{
@@ -426,12 +441,7 @@ var handlerTests = []handlerTest{
 	// Test recent permanode of a file
 	{
 		name: "recent-file",
-		setup: func(*test.FakeIndex) index.Interface {
-			// Ignore the fakeindex and use the real (but in-memory) implementation,
-			// using IndexDeps to populate it.
-			idx := index.NewMemoryIndex()
-			id := indextest.NewIndexDeps(idx)
-
+		setup: func(id *indexMapper) index.Interface {
 			// Upload a basic image
 			camliRootPath, err := osutil.GoPackagePath("camlistore.org")
 			if err != nil {
@@ -450,7 +460,7 @@ var handlerTests = []handlerTest{
 
 			pn := id.NewPlannedPermanode("pn1")
 			id.SetAttribute(pn, "camliContent", dudeFileRef.String())
-			return indexAndOwner{idx, id.SignerBlobRef}
+			return id.Index
 		},
 		query: "recent",
 		want: parseJSON(`{
@@ -495,14 +505,10 @@ var handlerTests = []handlerTest{
 	// Test recent permanode of a file, in a collection
 	{
 		name: "recent-file-collec",
-		setup: func(*test.FakeIndex) index.Interface {
+		setup: func(id *indexMapper) index.Interface {
 			SetTestHookBug121(func() {
 				time.Sleep(2 * time.Second)
 			})
-			// Ignore the fakeindex and use the real (but in-memory) implementation,
-			// using IndexDeps to populate it.
-			idx := index.NewMemoryIndex()
-			id := indextest.NewIndexDeps(idx)
 
 			// Upload a basic image
 			camliRootPath, err := osutil.GoPackagePath("camlistore.org")
@@ -523,7 +529,7 @@ var handlerTests = []handlerTest{
 			id.SetAttribute(pn, "camliContent", dudeFileRef.String())
 			collec := id.NewPlannedPermanode("pn2")
 			id.SetAttribute(collec, "camliMember", pn.String())
-			return indexAndOwner{idx, id.SignerBlobRef}
+			return id.Index
 		},
 		query: "recent",
 		want: parseJSON(`{
@@ -588,15 +594,10 @@ var handlerTests = []handlerTest{
 	// Test recent permanodes with thumbnails
 	{
 		name: "recent-thumbs",
-		setup: func(*test.FakeIndex) index.Interface {
-			// Ignore the fakeindex and use the real (but in-memory) implementation,
-			// using IndexDeps to populate it.
-			idx := index.NewMemoryIndex()
-			id := indextest.NewIndexDeps(idx)
-
+		setup: func(id *indexMapper) index.Interface {
 			pn := id.NewPlannedPermanode("pn1")
 			id.SetAttribute(pn, "title", "Some title")
-			return indexAndOwner{idx, id.SignerBlobRef}
+			return id.Index
 		},
 		query: "recent?thumbnails=100",
 		want: parseJSON(`{
@@ -624,19 +625,14 @@ var handlerTests = []handlerTest{
 	// back from member only reveal the first parent.
 	{
 		name: "edge-to",
-		setup: func(*test.FakeIndex) index.Interface {
-			// Ignore the fakeindex and use the real (but in-memory) implementation,
-			// using IndexDeps to populate it.
-			idx := index.NewMemoryIndex()
-			id := indextest.NewIndexDeps(idx)
-
+		setup: func(id *indexMapper) index.Interface {
 			parent1 := id.NewPlannedPermanode("pn1") // sha1-7ca7743e38854598680d94ef85348f2c48a44513
 			parent2 := id.NewPlannedPermanode("pn2")
 			member := id.NewPlannedPermanode("member") // always sha1-9ca84f904a9bc59e6599a53f0a3927636a6dbcae
 			id.AddAttribute(parent1, "camliMember", member.String())
 			id.AddAttribute(parent2, "camliMember", member.String())
 			id.DelAttribute(parent2, "camliMember", "")
-			return indexAndOwner{idx, id.SignerBlobRef}
+			return id.Index
 		},
 		query: "edgesto?blobref=sha1-9ca84f904a9bc59e6599a53f0a3927636a6dbcae",
 		want: parseJSON(`{
@@ -647,6 +643,29 @@ var handlerTests = []handlerTest{
 				]
 			}`),
 	},
+}
+
+func permResult(key string, title string, d time.Duration) string {
+	return `"` + key + `": ` + marshalJSON(DescribedBlob{
+		BlobRef:   blob.MustParse(key),
+		CamliType: "permanode",
+		Permanode: &DescribedPermanode{
+			Attr:    url.Values{"title": []string{title}},
+			ModTime: test.ClockOrigin.Add(d).UTC(),
+		},
+	})
+}
+
+func fileResult(key string, size int64) string {
+	return `"` + key + `": ` + marshalJSON(DescribedBlob{
+		BlobRef:   blob.MustParse(key),
+		CamliType: "file",
+		File: &camtypes.FileInfo{
+			FileName: strings.Replace(key, "-", "", 1),
+			Size:     size,
+			WholeRef: blob.MustParse("whole" + key),
+		},
+	})
 }
 
 func marshalJSON(v interface{}) string {
@@ -682,22 +701,30 @@ func init() {
 func (ht handlerTest) test(t *testing.T) {
 	SetTestHookBug121(func() {})
 
-	fakeIndex := test.NewFakeIndex()
-	idx := ht.setup(fakeIndex)
-
-	indexOwner := owner
-	if io, ok := idx.(indexOwnerer); ok {
-		indexOwner = io.IndexOwner()
+	im := indexMapper{
+		IndexDeps: indextest.NewIndexDeps(index.NewMemoryIndex()),
+		Refs:      make(map[string]blob.Ref),
 	}
-	h := NewHandler(idx, indexOwner)
+	idx := ht.setup(&im)
+
+	h := NewHandler(idx, im.IndexDeps.SignerBlobRef)
 
 	var body io.Reader
 	var method = "GET"
 	if ht.postBody != "" {
 		method = "POST"
-		body = strings.NewReader(ht.postBody)
+		var pm map[string]interface{}
+		err := json.Unmarshal([]byte(ht.postBody), &pm)
+		if err != nil {
+			t.Fatalf("%s: bad post body: %v", ht.name, err)
+		}
+		p, err := json.Marshal(im.MapMap(pm))
+		if err != nil {
+			t.Fatalf("%s: bad post body: %v", ht.name, err)
+		}
+		body = bytes.NewReader(p)
 	}
-	req, err := http.NewRequest(method, "/camli/search/"+ht.query, body)
+	req, err := http.NewRequest(method, im.MapUrl("/camli/search/"+ht.query), body)
 	if err != nil {
 		t.Fatalf("%s: bad query: %v", ht.name, err)
 	}
@@ -718,27 +745,33 @@ func (ht handlerTest) test(t *testing.T) {
 		for k := range dr.Meta {
 			gotDesc = append(gotDesc, k)
 		}
-		sort.Strings(ht.wantDescribed)
+		wantDescribed := make([]string, len(ht.wantDescribed))
+		for i, key := range ht.wantDescribed {
+			wantDescribed[i] = im.Map(key)
+		}
+		sort.Strings(wantDescribed)
 		sort.Strings(gotDesc)
-		if !reflect.DeepEqual(gotDesc, ht.wantDescribed) {
+		if !reflect.DeepEqual(gotDesc, wantDescribed) {
 			t.Errorf("On test %s: described blobs:\n%v\nwant:\n%v\n",
-				ht.name, gotDesc, ht.wantDescribed)
+				ht.name, gotDesc, wantDescribed)
 		}
 		if ht.want == nil {
 			return
 		}
 	}
 
-	want, _ := json.MarshalIndent(ht.want, "", "  ")
+	mapped := im.MapMap(ht.want)
+	want, _ := json.MarshalIndent(mapped, "", "  ")
 	trim := bytes.TrimSpace
 
 	if bytes.Equal(trim(got), trim(want)) {
 		return
 	}
 
-	// Try with re-encoded got, since the JSON ordering doesn't matter
-	// to the test,
+	// Try with re-encoded got, since the JSON ordering
+	// and sizes we don't care about doesn't matter.
 	gotj := parseJSON(string(got))
+	cleanZeroMetaSizes(gotj, mapped)
 	got2, _ := json.MarshalIndent(gotj, "", "  ")
 	if bytes.Equal(got2, want) {
 		return
@@ -746,6 +779,40 @@ func (ht handlerTest) test(t *testing.T) {
 	diff := test.Diff(want, got2)
 
 	t.Errorf("test %s:\nwant: %s\n got: %s\ndiff:\n%s", ht.name, want, got, diff)
+}
+
+// cleanZeroMetaSizes sets the size for permanodes in res
+// from base if the size is missing or zero.
+func cleanZeroMetaSizes(res, base map[string]interface{}) {
+	i := res["meta"]
+	rmeta, ok := i.(map[string]interface{})
+	if !ok {
+		return
+	}
+	i = base["meta"]
+	bmeta, ok := i.(map[string]interface{})
+	if !ok {
+		return
+	}
+	for k, v := range bmeta {
+		i = rmeta[k]
+		rmap, ok := i.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		bmap, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		i = bmap["size"]
+		bsize, ok := i.(float64)
+		switch {
+		case !ok:
+			delete(rmap, "size")
+		case bsize == 0:
+			rmap["size"] = i
+		}
+	}
 }
 
 func TestHandler(t *testing.T) {

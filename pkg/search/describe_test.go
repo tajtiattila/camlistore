@@ -17,131 +17,130 @@ limitations under the License.
 package search_test
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"testing"
+	"time"
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/index"
 	"camlistore.org/pkg/index/indextest"
 	"camlistore.org/pkg/search"
-	"camlistore.org/pkg/test"
-	"camlistore.org/pkg/types/camtypes"
 
 	"golang.org/x/net/context"
 )
 
-func addPermanode(fi *test.FakeIndex, pnStr string, attrs ...string) {
-	pn := blob.MustParse(pnStr)
-	fi.AddMeta(pn, "permanode", 123)
-	for len(attrs) > 0 {
-		k, v := attrs[0], attrs[1]
-		attrs = attrs[2:]
-		fi.AddClaim(owner, pn, "add-attribute", k, v)
+func searchDescribeSetup(im *indexMapper) index.Interface {
+
+	addPermanode := func(key string, attrs ...string) string {
+		return im.AddPermanode(key, attrs...).String()
 	}
-}
 
-func addFileWithLocation(fi *test.FakeIndex, fileStr string, lat, long float64) {
-	fileRef := blob.MustParse(fileStr)
-	fi.AddFileLocation(fileRef, camtypes.Location{Latitude: lat, Longitude: long})
-	fi.AddMeta(fileRef, "file", 123)
-}
+	addFileWithLocation := func(key string, lat, long float64) string {
+		fileRef, _ := im.UploadFile(key+".jpg",
+			exifFileContentLatLong(lat, long), time.Time{})
+		im.Refs[key] = fileRef
+		return fileRef.String()
+	}
 
-func searchDescribeSetup(fi *test.FakeIndex) index.Interface {
-	addPermanode(fi, "abc-123",
-		"camliContent", "abc-123c",
-		"camliImageContent", "abc-888",
-	)
-	addPermanode(fi, "abc-123c",
-		"camliContent", "abc-123cc",
-		"camliImageContent", "abc-123c1",
-	)
-	addPermanode(fi, "abc-123c1",
-		"some", "image",
-	)
-	addPermanode(fi, "abc-123cc",
+	abc123cc := addPermanode("abc-123cc",
 		"name", "leaf",
 	)
-	addPermanode(fi, "abc-888",
-		"camliContent", "abc-8881",
+	abc123c1 := addPermanode("abc-123c1",
+		"some", "image",
 	)
-	addPermanode(fi, "abc-8881",
+	abc123c := addPermanode("abc-123c",
+		"camliContent", abc123cc,
+		"camliImageContent", abc123c1,
+	)
+	abc8881 := addPermanode("abc-8881",
 		"name", "leaf8881",
 	)
-
-	addPermanode(fi, "fourcheckin-0",
-		"camliNodeType", "foursquare.com:checkin",
-		"foursquareVenuePermanode", "fourvenue-123",
+	abc888 := addPermanode("abc-888",
+		"camliContent", abc8881,
 	)
-	addPermanode(fi, "fourvenue-123",
+	addPermanode("abc-123",
+		"camliContent", abc123c,
+		"camliImageContent", abc888,
+	)
+
+	somevenuepic0 := addPermanode("somevenuepic-0",
+		"foo", "bar",
+	)
+	venuepic1 := addPermanode("venuepic-1",
+		"camliContent", somevenuepic0,
+	)
+	venuepicset123 := addPermanode("venuepicset-123",
+		"camliPath:1.jpg", venuepic1,
+	)
+	fourvenue123 := addPermanode("fourvenue-123",
 		"camliNodeType", "foursquare.com:venue",
-		"camliPath:photos", "venuepicset-123",
+		"camliPath:photos", venuepicset123,
 		"latitude", "12",
 		"longitude", "34",
 	)
-	addPermanode(fi, "venuepicset-123",
-		"camliPath:1.jpg", "venuepic-1",
+	addPermanode("fourcheckin-0",
+		"camliNodeType", "foursquare.com:checkin",
+		"foursquareVenuePermanode", fourvenue123,
 	)
-	addPermanode(fi, "venuepic-1",
-		"camliContent", "somevenuepic-0",
-	)
-	addPermanode(fi, "somevenuepic-0",
-		"foo", "bar",
-	)
-	addPermanode(fi, "venuepic-2",
-		"camliContent", "somevenuepic-2",
-	)
-	addPermanode(fi, "somevenuepic-2",
+	somevenuepic2 := addPermanode("somevenuepic-2",
 		"foo", "baz",
 	)
+	venuepic2 := addPermanode("venuepic-2",
+		"camliContent", somevenuepic2,
+	)
 
-	addPermanode(fi, "homedir-0",
-		"camliPath:subdir.1", "homedir-1",
-	)
-	addPermanode(fi, "homedir-1",
-		"camliPath:subdir.2", "homedir-2",
-	)
-	addPermanode(fi, "homedir-2",
+	homedir2 := addPermanode("homedir-2",
 		"foo", "bar",
 	)
-
-	addPermanode(fi, "set-0",
-		"camliMember", "venuepic-1",
-		"camliMember", "venuepic-2",
+	homedir1 := addPermanode("homedir-1",
+		"camliPath:subdir.2", homedir2,
+	)
+	addPermanode("homedir-0",
+		"camliPath:subdir.1", homedir1,
 	)
 
-	addFileWithLocation(fi, "filewithloc-0", 45, 56)
-	addPermanode(fi, "location-0",
-		"camliContent", "filewithloc-0",
+	addPermanode("set-0",
+		"camliMember", venuepic1,
+		"camliMember", venuepic2,
 	)
 
-	addPermanode(fi, "locationpriority-1",
+	filewithloc0 := addFileWithLocation("filewithloc-0", 45, 56)
+	addPermanode("location-0",
+		"camliContent", filewithloc0,
+	)
+
+	addPermanode("locationpriority-1",
 		"latitude", "67",
 		"longitude", "78",
 		"camliNodeType", "foursquare.com:checkin",
-		"foursquareVenuePermanode", "fourvenue-123",
-		"camliContent", "filewithloc-0",
+		"foursquareVenuePermanode", fourvenue123,
+		"camliContent", filewithloc0,
 	)
 
-	addPermanode(fi, "locationpriority-2",
+	addPermanode("locationpriority-2",
 		"camliNodeType", "foursquare.com:checkin",
-		"foursquareVenuePermanode", "fourvenue-123",
-		"camliContent", "filewithloc-0",
+		"foursquareVenuePermanode", fourvenue123,
+		"camliContent", filewithloc0,
 	)
 
-	addPermanode(fi, "locationoverride-1",
+	addPermanode("locationoverride-1",
 		"latitude", "67",
 		"longitude", "78",
-		"camliContent", "filewithloc-0",
+		"camliContent", filewithloc0,
 	)
 
-	addPermanode(fi, "locationoverride-2",
+	addPermanode("locationoverride-2",
 		"latitude", "67",
 		"longitude", "78",
 		"camliNodeType", "foursquare.com:checkin",
-		"foursquareVenuePermanode", "fourvenue-123",
+		"foursquareVenuePermanode", fourvenue123,
 	)
 
-	return fi
+	return im.Index
 }
 
 var searchDescribeTests = []handlerTest{
@@ -367,16 +366,20 @@ func TestDescribeLocation(t *testing.T) {
 		{"locationoverride-2", 67, 78},
 	}
 
-	ix := searchDescribeSetup(test.NewFakeIndex())
+	im := indexMapper{
+		IndexDeps: indextest.NewIndexDeps(index.NewMemoryIndex()),
+		Refs:      make(map[string]blob.Ref),
+	}
+	ix := searchDescribeSetup(&im)
 	ctx := context.Background()
-	h := search.NewHandler(ix, owner)
+	h := search.NewHandler(ix, im.SignerBlobRef)
 
 	ix.RLock()
 	defer ix.RUnlock()
 
 	for _, tt := range tests {
 		var err error
-		br := blob.MustParse(tt.ref)
+		br := im.Ref(tt.ref)
 		res, err := h.Describe(ctx, &search.DescribeRequest{
 			BlobRef: br,
 			Depth:   1,
@@ -401,3 +404,141 @@ func TestDescribeLocation(t *testing.T) {
 		}
 	}
 }
+
+// exifFileContentLatLong returns the contents of a
+// jpeg/exif file with GPS coordinates.
+func exifFileContentLatLong(lat, long float64) string {
+	var buf bytes.Buffer
+	jpeg.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 128, 128)), nil)
+	j := buf.Bytes()
+
+	x := rawExifLatLong(lat, long)
+
+	app1sec := []byte{0xff, 0xe1, 0, 0}
+	binary.BigEndian.PutUint16(app1sec[2:], uint16(len(x)+2))
+
+	p := make([]byte, 0, len(j)+len(app1sec)+len(x))
+	p = append(p, j[:2]...)   // ff d8
+	p = append(p, app1sec...) // exif section header
+	p = append(p, x...)       // raw exif
+	p = append(p, j[2:]...)   // jpeg image
+
+	return string(p)
+}
+
+// rawExifLatLong creates raw exif for lat/long
+// for storage in a jpeg file.
+func rawExifLatLong(lat, long float64) []byte {
+
+	x := exifBuf{
+		bo: binary.BigEndian,
+		p:  []byte("MM"),
+	}
+
+	x.putUint16(42) // magic
+
+	ifd0ofs := x.reservePtr() // room for ifd0 offset
+	x.storePtr(ifd0ofs)
+
+	const (
+		gpsSubIfdTag = 0x8825
+
+		gpsLatitudeRef  = 1
+		gpsLatitude     = 2
+		gpsLongitudeRef = 3
+		gpsLongitude    = 4
+
+		typeAscii    = 2
+		typeLong     = 4
+		typeRational = 5
+	)
+
+	// IFD0
+	x.storePtr(ifd0ofs)
+	x.putUint16(1) // 1 tag
+
+	x.putTag(gpsSubIfdTag, typeLong, 1)
+	gpsofs := x.reservePtr()
+
+	// IFD1
+	x.putUint32(0) // no IFD1
+
+	// GPS sub-IFD
+	x.storePtr(gpsofs)
+	x.putUint16(4) // 4 tags
+
+	x.putTag(gpsLatitudeRef, typeAscii, 2)
+	if lat >= 0 {
+		x.next(4)[0] = 'N'
+	} else {
+		x.next(4)[0] = 'S'
+	}
+
+	x.putTag(gpsLatitude, typeRational, 3)
+	latptr := x.reservePtr()
+
+	x.putTag(gpsLongitudeRef, typeAscii, 2)
+	if long >= 0 {
+		x.next(4)[0] = 'E'
+	} else {
+		x.next(4)[0] = 'W'
+	}
+
+	x.putTag(gpsLongitude, typeRational, 3)
+	longptr := x.reservePtr()
+
+	// write data referenced in GPS sub-IFD
+	x.storePtr(latptr)
+	x.putDegMinSecRat(lat)
+
+	x.storePtr(longptr)
+	x.putDegMinSecRat(long)
+
+	return append([]byte("Exif\x00\x00"), x.p...)
+}
+
+type exifBuf struct {
+	bo binary.ByteOrder
+	p  []byte
+}
+
+func (x *exifBuf) next(n int) []byte {
+	l := len(x.p)
+	x.p = append(x.p, make([]byte, n)...)
+	return x.p[l:]
+}
+
+func (x *exifBuf) putTag(tag, typ uint16, len uint32) {
+	x.putUint16(tag)
+	x.putUint16(typ)
+	x.putUint32(len)
+}
+
+func (x *exifBuf) putUint16(n uint16) { x.bo.PutUint16(x.next(2), n) }
+func (x *exifBuf) putUint32(n uint32) { x.bo.PutUint32(x.next(4), n) }
+
+func (x *exifBuf) putDegMinSecRat(v float64) {
+	if v < 0 {
+		v = -v
+	}
+	deg := uint32(v)
+	v = 60 * (v - float64(deg))
+	min := uint32(v)
+	v = 60 * (v - float64(min))
+	μsec := uint32(v * 1e6)
+
+	x.putUint32(deg)
+	x.putUint32(1)
+	x.putUint32(min)
+	x.putUint32(1)
+	x.putUint32(μsec)
+	x.putUint32(1e6)
+}
+
+func (x *exifBuf) reservePtr() int {
+	l := len(x.p)
+	x.next(4)
+	return l
+}
+
+func (x *exifBuf) storePtr(ofs int) { x.bo.PutUint32(x.p[ofs:], uint32(len(x.p))) }
